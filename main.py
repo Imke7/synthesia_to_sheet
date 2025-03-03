@@ -5,13 +5,19 @@ import yt_dlp
 import numpy as np
 import matplotlib.pyplot as plt
 from midiutil import MIDIFile
+import time
+import multiprocessing
 
 VIDEO_FOLDER = 'cache/video'
 FRAMES_FOLDER = 'cache/frames'
-THE_MIDI = MIDIFile(2)
+THE_MIDI = MIDIFile(numTracks=2, adjust_origin=True)
 ALL_KEYS = []
 Y_BLACK_KEYS = -1
 Y_WHITE_KEYS = -1
+BPM = 104
+S_PER_FRAME = 1 / 30.0
+DIVISION_NOTE = 79 # lowest note of right hand
+FIRST_ACTIVE_FRAME = 0
 
 class PianoKey():
     def __init__(self, pitch, left_border, right_border, y_coordinate):
@@ -21,15 +27,73 @@ class PianoKey():
         self.right_border = right_border
         self.y = y_coordinate
         self.active_frames = []
+        self.base_color = None
 
     def calculate_pixel_group(self):
         # compute array of four pixels in the middle of the key
         x_middle = round((self.left_border + self.right_border) / 2)
         self.pixels = [(x_middle - 1, self.y - 1), (x_middle - 1, self.y + 1), (x_middle + 1, self.y - 1), (x_middle + 1, self.y + 1)]
 
-    def is_active():
-        # Determine if the key is pressed
-        pass
+    def is_active(self, image, frame_number):
+        # Determine if the key is pressed is the image
+        #image = cv2.imread(image_path)
+        threshold = 50  # Adjust as needed
+        
+        # Compute average color
+        colors = np.array([image[y, x] for x, y in self.pixels], dtype=np.float32)
+        average_color = np.mean(colors, axis=0).astype(np.uint8)
+
+        difference = np.linalg.norm(average_color - self.base_color)
+
+        #if difference > threshold: 
+        #    self.active_frames.append(frame_number)
+        
+        return difference > threshold
+
+
+    def set_base_color(self, image):
+        # Set the default color of this pixel set
+        #image = cv2.imread(image_path)
+
+        # Extract pixel values and compute color
+        colors = np.array([image[y, x] for x, y in self.pixels], dtype=np.float32)
+        average_color = np.mean(colors, axis=0).astype(np.uint8)
+
+        self.base_color = np.array(average_color, dtype=np.float32)
+
+    def write_to_midi(self):
+        if len(self.active_frames) == 0:
+            return
+        
+        track = 1
+        if self.pitch < DIVISION_NOTE:
+            track = 0
+
+        start_of_chain = self.active_frames[0]
+        prev_active_frame = self.active_frames[0]
+  
+        for n in self.active_frames[1:]:
+            if n - prev_active_frame > 1: # this is a new note
+                n_frames = prev_active_frame - start_of_chain + 1
+                duration = n_frames * S_PER_FRAME * (BPM / 60.0)
+                starting_beat = start_of_chain * S_PER_FRAME * (BPM / 60.0)
+                print(f"add note with pitch {self.pitch} at beat {starting_beat} for {duration} beats")
+                THE_MIDI.addNote(track=track, channel=0, pitch=self.pitch, time=starting_beat, duration=duration, volume=100)
+                start_of_chain = n 
+            prev_active_frame = n
+
+        # also do the last note
+        n_frames = prev_active_frame - start_of_chain + 1
+        duration = n_frames * S_PER_FRAME * (BPM / 60.0)
+        starting_beat = start_of_chain * S_PER_FRAME * (BPM / 60.0)
+        print(f"add note with pitch {self.pitch} at beat {starting_beat} for {duration} beats")
+        THE_MIDI.addNote(track=track, channel=0, pitch=self.pitch, time=starting_beat, duration=duration, volume=100)
+
+        
+
+            
+        
+        
 
 
 
@@ -408,15 +472,16 @@ def compute_key_info():
     plt.show()
     '''
 
-    image = plt.imread(os.path.join(FRAMES_FOLDER, "frame_000000.jpg"))
-    fig, ax = plt.subplots()
-    ax.imshow(image)
+    
+    #image = plt.imread(os.path.join(FRAMES_FOLDER, "frame_000000.jpg"))
+    #fig, ax = plt.subplots()
+    #ax.imshow(image)
 
     # Compute set of pixels for each key
     for key in ALL_KEYS:
         key.calculate_pixel_group()
-        for coord in key.pixels:
-            ax.plot(coord[0], coord[1], 'ro', markersize=1)
+    #    for coord in key.pixels:
+    #        ax.plot(coord[0], coord[1], 'ro', markersize=1)
 
     #plt.show()
 
@@ -428,6 +493,8 @@ def safe_midi():
     with open("output.mid", "wb") as f:
         THE_MIDI.writeFile(f)
 
+    print("MIDI file saved successfully")
+
 def create_midi(tempo):
     THE_MIDI.addTrackName(0, 0, "Left Hand Piano")
     THE_MIDI.addTrackName(1, 0, "Right Hand Piano")
@@ -435,10 +502,10 @@ def create_midi(tempo):
     THE_MIDI.addTempo(track = 1, time = 0, tempo = tempo)
 
     # test it out
-    THE_MIDI.addNote(track=0, channel=0, pitch=36, time=0, duration=1, volume=100)
-    THE_MIDI.addNote(track=1, channel=0, pitch=84, time=0, duration=1, volume=100)
+    #THE_MIDI.addNote(track=0, channel=0, pitch=36, time=0, duration=1, volume=100)
+    #THE_MIDI.addNote(track=1, channel=0, pitch=84, time=0, duration=1, volume=100)
 
-    safe_midi()
+    #safe_midi()
 
 def get_user_metadata():
     tempo = input("Wat is het tempo? ")
@@ -446,17 +513,103 @@ def get_user_metadata():
     print("We moeten een scheiding maken van de laagste noot die bij de rechter hand hoort.")
     division_note = get_user_input_notenumber()
 
-    
+def compute_active_frames():
+    count = 0
+
+    print("Start timer")
+    t_start = time.time()
+
+    frame_files = sorted(
+        [entry.path for entry in os.scandir(FRAMES_FOLDER) if entry.is_file()],
+        key=lambda x: int(os.path.basename(x).split('_')[-1].split('.')[0])
+    )
+
+    for image_path in frame_files:  
+        image = cv2.imread(image_path)
+        for key in ALL_KEYS:
+            key.is_active(image, count)
+        count += 1
+        if count % 10 == 0:
+            print(f"Analyzed {count} frames")
+
+    t_end = time.time()
+
+    print(f"Analyzed a total of {count} frames in {t_end - t_start} seconds")
+
+
+def process_frame(frame_number, image_path):
+    image = cv2.imread(image_path)
+
+    active_keys = []
+
+    for key in ALL_KEYS:
+        if key.is_active(image, frame_number):
+            active_keys.append((key.pitch, frame_number))
+
+    return active_keys
+
+def compute_active_frames_parallel():
+    t_start = time.time()
+
+    frame_files = sorted(
+        [entry.path for entry in os.scandir(FRAMES_FOLDER) if entry.is_file()],
+        key=lambda x: int(os.path.basename(x).split('_')[-1].split('.')[0])
+    )
+
+    with multiprocessing.Pool(processes=multiprocessing.cpu_count()) as pool:
+        results = pool.starmap(process_frame, enumerate(frame_files))
+
+    for active_keys in results:
+        for pitch, frame_number in active_keys:
+            for key in ALL_KEYS:
+                if key.pitch == pitch:
+                    key.active_frames.append(frame_number)
+
+    t_end = time.time()
+
+    print(f"Analyzed a total of {len(frame_files)} frames in {t_end - t_start} seconds")
+                
+
+def shift_frames():
+    first_active_frame = 1000
+    # determine first active frame
+    for key in ALL_KEYS:
+        if len(key.active_frames) > 0 and key.active_frames[0] < first_active_frame:
+            first_active_frame = key.active_frames[0]
+
+    # shift all of frames
+    for key in ALL_KEYS:
+        for i in range(len(key.active_frames)):
+            key.active_frames[i] -= first_active_frame
 
 if __name__ == "__main__":
     '''
-    video_name = download_video("https://www.youtube.com/watch?v=tSkFpBfbUV4")
+    video_name = download_video("https://www.youtube.com/watch?v=C23xEqJdP7s")
+    
     extract_frames(video_name)
     '''
+    
 
-    create_midi(120)
-    detect_keys_debug()
-    #detect_keys2("frame_000000.jpg")
+    create_midi(BPM)
+    detect_keys2("frame_000000.jpg")
 
     compute_key_info()
+
+    # Set base color for all keys
+    image = cv2.imread(os.path.join(FRAMES_FOLDER, "frame_000000.jpg"))
+    for key in ALL_KEYS:
+        key.set_base_color(image)
+    
+    #compute_active_frames()
+
+    compute_active_frames_parallel()
+
+    shift_frames()
+
+    for key in ALL_KEYS:
+        print(key.active_frames)
+        key.write_to_midi()
+
+    safe_midi()
+    
 
